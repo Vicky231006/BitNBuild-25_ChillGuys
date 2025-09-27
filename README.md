@@ -10,7 +10,7 @@ Git Clone the repo and Cd into it.
 ### Step 2: 
 `Export GEMINI_API_KEY="ENTER VALUE HERE"`
 ### Step 3:
-`Python3 app39.py`
+`Python3 main.py`
 ### Step 4:
 Make a REST POST API request. Look at the sample Input for examples.
 
