@@ -1,8 +1,8 @@
 # TAX Calculator Module 
 ## Index:
-[Installation](https://github.com/Vicky231006/BitNBuild-25_ChillGuys/edit/Ashutosh/README.md/)
-[Input](https://github.com/Vicky231006/BitNBuild-25_ChillGuys/edit/Ashutosh/README.md/#Input)
-[Ouput](https://github.com/Vicky231006/BitNBuild-25_ChillGuys/edit/Ashutosh/README.md/#Output)
+[Installation](https://github.com/Vicky231006/BitNBuild-25_ChillGuys/Ashutosh/README.md/)
+[Input](https://github.com/Vicky231006/BitNBuild-25_ChillGuys/Ashutosh/README.md/#Input)
+[Ouput](https://github.com/Vicky231006/BitNBuild-25_ChillGuys/Ashutosh/README.md/#Output)
 ## Instructions to Use:
 Git Clone the repo and Cd into it.
 ### Step 1: 
