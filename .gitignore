@@ -1,0 +1,6 @@
+.env
+mock-generator.py
+ai_parser_module.py
+mock_generator.py
+.venv
+__pycache__
