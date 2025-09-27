@@ -9,3 +9,4 @@ numpy
 Faker
 dataclasses
 typing
+python-multipart
