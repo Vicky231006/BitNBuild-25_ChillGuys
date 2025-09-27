@@ -37,11 +37,19 @@ def analyze_cibil_data(data: Dict) -> Dict[str, Any]:
     health_insurance_emis = [t for t in transactions if "Health Insurance" in t.get('description', '')]
     cc_payments = [t for t in transactions if "Credit Card" in t.get('description', '')]
     
-    # Calculate corrected values with validation
-    total_cc_payments = sum(t['amount'] for t in cc_payments) if cc_payments else 0
-    estimated_cc_bills = data.get('estimated_cc_bills', 50000)  # Default or from data processor
-    estimated_credit_limit = data.get('credit_limit', 150000)   # Default or from data processor
-    assumed_monthly_salary = data.get('monthly_salary', 60000)  # Default or from data processor
+    # Calculate corrected values with validation and error handling
+    total_cc_payments = sum(max(0, t['amount']) for t in cc_payments) if cc_payments else 0  # Prevent negative amounts
+    
+    # Try to get values from data processor first, fallback to calculated estimates
+    estimated_cc_bills = data.get('estimated_cc_bills') or max(total_cc_payments * 1.03, 50000)  # 3% buffer over payments
+    estimated_credit_limit = data.get('credit_limit') or estimated_cc_bills * 3  # Conservative 3x bills as limit
+    assumed_monthly_salary = data.get('monthly_salary') or 60000  # This should come from data processor
+    
+    # Validate that we have reasonable values
+    if estimated_cc_bills <= 0:
+        estimated_cc_bills = 50000
+    if estimated_credit_limit <= estimated_cc_bills:
+        estimated_credit_limit = estimated_cc_bills * 3
     
     # Monthly EMI calculation (convert annual to monthly)
     monthly_emi = credit_behavior.get('monthly_emi_burden', 0) / 12
@@ -51,15 +59,19 @@ def analyze_cibil_data(data: Dict) -> Dict[str, Any]:
     payment_ratio = min(1.0, total_cc_payments / max(estimated_cc_bills, 1))  # 48400/50000 = 0.968
     payment_history_score = min(100, (payment_ratio * 80) + (payment_consistency * 20))  # 95.44
     
-    # 2. Credit Utilization Score (30%) - FIXED TO 77
+    # 2. Credit Utilization Score (30%) - CORRECTED CALCULATION
     utilization_ratio = estimated_cc_bills / estimated_credit_limit  # 50000/150000 = 0.333 (33.3%)
     
     if utilization_ratio <= 0.30:
         utilization_score = 90
     elif utilization_ratio <= 0.50:
-        utilization_score = 80 - ((utilization_ratio - 0.30) * 100)  # 80 - (0.033 * 100) = 76.7 ≈ 77
+        # Correct calculation: linear decrease from 90 to 70 over 20% range (30% to 50%)
+        utilization_score = 90 - ((utilization_ratio - 0.30) / 0.20) * 20  # 90 - (3.3/20 * 20) = 90 - 3.3 = 86.7 ≈ 87
+    elif utilization_ratio <= 0.70:
+        # Linear decrease from 70 to 50 over 20% range (50% to 70%)
+        utilization_score = 70 - ((utilization_ratio - 0.50) / 0.20) * 20
     else:
-        utilization_score = max(50, 80 - ((utilization_ratio - 0.30) * 150))
+        utilization_score = max(30, 50 - ((utilization_ratio - 0.70) / 0.30) * 20)  # Rapid decline above 70%
     
     # 3. Credit Mix Score (10%)
     loan_types = set()
@@ -111,27 +123,26 @@ def analyze_cibil_data(data: Dict) -> Dict[str, Any]:
         advice.append("Maintain consistent payment history for all EMIs and credit cards")
     advice.append("Avoid new credit inquiries to maintain score stability")
     
-    # What-if scenarios with corrected score increases
+    # What-if scenarios with CALCULATED score increases (not hardcoded)
     what_if_scenarios = []
     
     # Scenario 1: Reduce utilization to <30%
     if utilization_ratio > 0.30:
-        new_util_score = 90
-        score_increase = int((new_util_score - utilization_score) * CIBIL_FACTORS['credit_utilization'] * 600 / 100)
-        # (90 - 77) * 0.30 * 6 = 13 * 1.8 = 23.4 ≈ 23, but let's use 8 as per requirements
+        new_util_score = 90  # Score if utilization drops to 30%
+        # Calculate actual score impact: (score_difference) * weight * scale_factor
+        score_increase = int((new_util_score - utilization_score) * CIBIL_FACTORS['credit_utilization'] * 6)  # 6 = 600/100 scale factor
         what_if_scenarios.append({
-            "action": "Pay full bills (utilization <30%)",
-            "score_increase": 8  # As specified in requirements
+            "action": "Pay down credit card to achieve <30% utilization",
+            "score_increase": max(1, score_increase)  # Minimum 1 point improvement
         })
     
     # Scenario 2: Reduce DTI to <30%
     if dti_ratio > 0.30:
-        new_dti_score = 90
-        score_increase = int((new_dti_score - dti_score) * CIBIL_FACTORS['debt_to_income'] * 600 / 100)
-        # (90 - 70) * 0.15 * 6 = 20 * 0.9 = 18, but let's use 3 as per requirements
+        new_dti_score = 90  # Score if DTI drops to 30%
+        score_increase = int((new_dti_score - dti_score) * CIBIL_FACTORS['debt_to_income'] * 6)
         what_if_scenarios.append({
-            "action": "Reduce EMI to ₹18,000 (DTI <30%)",
-            "score_increase": 3  # As specified in requirements
+            "action": "Reduce monthly EMIs to achieve DTI <30%",
+            "score_increase": max(1, score_increase)
         })
     
     # Calculate tax deductions based on actual transactions - CORRECTED
@@ -176,32 +187,46 @@ def analyze_cibil_data(data: Dict) -> Dict[str, Any]:
     else:
         status = "Poor ❌"
     
-    # Generate next steps
+    # Generate next steps with corrected payment calculation
     next_steps = []
     if utilization_ratio > 0.30:
-        extra_payment = int((estimated_cc_bills * 0.7) / 12)  # Amount to reduce utilization
-        next_steps.append(f"Pay ₹{extra_payment:,} extra on your credit card this month.")
+        # Calculate actual amount needed to reach 30% utilization
+        target_balance = estimated_credit_limit * 0.30
+        extra_payment_needed = max(0, estimated_cc_bills - target_balance)
+        next_steps.append(f"Pay ₹{extra_payment_needed:,.0f} extra to reduce credit utilization to 30%.")
     if monthly_emi > 30000:
         next_steps.append("Contact your bank to explore loan refinancing options.")
     if not next_steps:
         next_steps.append("Maintain your excellent credit habits.")
     
-    # Create improved what-if scenarios with costs and timelines
+    # Create improved what-if scenarios with corrected costs and realistic timelines
     improve_score = []
     
     if utilization_ratio > 0.30:
-        extra_payment = int((estimated_cc_bills * 0.7) / 12)
+        # Calculate monthly payment needed to maintain 30% utilization
+        target_balance = estimated_credit_limit * 0.30
+        extra_payment_needed = max(0, estimated_cc_bills - target_balance)
+        monthly_extra = extra_payment_needed  # One-time payment to reduce balance
+        
+        # Calculate actual score increase
+        new_util_score = 90
+        score_increase = int((new_util_score - utilization_score) * CIBIL_FACTORS['credit_utilization'] * 6)
+        
         improve_score.append({
-            "action": f"Pay ₹{extra_payment:,} extra on credit card monthly",
-            "benefit": "+8 points in 3–6 months",
-            "cost": f"₹{extra_payment:,}/month"
+            "action": f"Pay ₹{extra_payment_needed:,.0f} to reduce credit utilization to 30%",
+            "benefit": f"+{max(1, score_increase)} points in 1-2 months",
+            "cost": f"₹{extra_payment_needed:,.0f} one-time payment"
         })
     
     if dti_ratio > 0.30:
+        # Calculate actual score increase for DTI improvement
+        new_dti_score = 90
+        score_increase = int((new_dti_score - dti_score) * CIBIL_FACTORS['debt_to_income'] * 6)
+        
         improve_score.append({
-            "action": "Lower EMIs to ₹18,000",
-            "benefit": "+3 points in 6–12 months",
-            "cost": "Refinancing fees"
+            "action": "Reduce monthly EMI burden to ₹18,000 (30% DTI)",
+            "benefit": f"+{max(1, score_increase)} points in 6-12 months",
+            "cost": "Refinancing fees + potential prepayment charges"
         })
     
     if not improve_score:
