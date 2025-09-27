@@ -1,15 +1,9 @@
-# FastAPI CIBIL Analysis Service - Requirements
-# Port 8001 - CIBIL Score Analysis and Tax Calculation
-
-# Core FastAPI framework
 fastapi
 uvicorn[standard]
-
-# HTTP requests to communicate with processing hub
 requests
-
-# Type hints and data validation
-typing-extensions
+matplotlib
+seaborn
+numpy
+pandas
+python-multipart
 pydantic
-
-
