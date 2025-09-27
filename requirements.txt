@@ -1,0 +1,54 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pandas
+pdfplumber
+python-dateutil
+requests
+aiohttp
+return {
+            'session_id': session_id,
+            'tax_relevant_data': data.tax_relevant_data,
+            'income_analysis': data.income_analysis,
+            'income_transactions': income_transactions,
+            'investment_transactions': investment_transactions,
+            'SELECTED_TAX_REGIME': {
+                'chosen_regime': data.tax_relevant_data.get('recommended_regime', 'new').upper(),
+                'regime_decision_reason': data.tax_relevant_data.get('reason', 'Optimized for lowest tax liability'),
+                'old_regime_tax': data.tax_relevant_data.get('old_regime_tax', 0),
+                'new_regime_tax': data.tax_relevant_data.get('new_regime_tax', 0),
+                'tax_savings_by_optimal_choice': data.tax_relevant_data.get('tax_savings_by_choosing_optimal', 0),
+                'detailed_comparison': data.tax_relevant_data.get('regime_comparison', {})
+            },
+            'COMPREHENSIVE_DEDUCTIONS_FOUND': data.tax_relevant_data.get('deduction_breakdown', {}),
+            'REMAINING_INVESTMENT_OPPORTUNITIES': data.tax_relevant_data.get('remaining_limits', {}),
+            'OPTIMIZATION_RECOMMENDATIONS': {
+                'additional_80c_investment': data.tax_relevant_data.get('remaining_limits', {}).get('80C', 0),
+                'health_insurance_scope': data.tax_relevant_data.get('remaining_limits', {}).get('80D_Self', 0),
+                'nps_investment_scope': data.tax_relevant_data.get('remaining_limits', {}).get('80CCD1B_NPS', 0),
+                'home_loan_interest_scope': data.tax_relevant_data.get('remaining_limits', {}).get('24B_Home_Loan', 0),
+                'potential_additional_savings': data.tax_relevant_data.get('potential_additional_savings', 0)
+            },
+            'deduction_eligible_expenses': [
+                t.to_dict() for t in data.transactions 
+                if t.subcategory and ('tax' in t.subcategory.lower() or t.category in ['Insurance', 'Investment'])
+            ],
+            'detailed_section_wise_breakdown': data.tax_relevant_data.get('deduction_details', {}),
+            'financial_year': data.tax_relevant_data.get('financial_year', '2024-25'),
+            'indian_tax_compliance': {
+                'sections_covered': [
+                    "Section 80C - Investment deductions (₹1,50,000 limit)",
+                    "Section 80D - Health insurance premiums (₹25,000/₹50,000 limit)",
+                    "Section 80E - Education loan interest (No limit)",
+                    "Section 80G - Donations (Various limits)",
+                    "Section 80CCD(1B) - Additional NPS (₹50,000 limit)",
+                    "Section 24(b) - Home loan interest (₹2,00,000 limit)",
+                    "HRA Exemption - House rent allowance"
+                ],
+                'tax_slabs_2024_25': {
+                    'old_regime': "₹2.5L-₹5L: 5%, ₹5L-₹10L: 20%, Above ₹10L: 30%",
+                    'new_regime': "₹3L-₹6L: 5%, ₹6L-₹9L: 10%, ₹9L-₹12L: 15%, ₹12L-₹15L: 20%, Above ₹15L: 30%"
+                },
+                'standard_deduction': "₹50,000 (Both regimes)",
+                'cess': "4% Health & Education Cess on total tax"
+            }
