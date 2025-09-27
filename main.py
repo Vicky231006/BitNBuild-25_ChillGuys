@@ -18,22 +18,20 @@ from enum import Enum
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from faker import Faker
-import random # Ensure random is imported for mock generator
+import random 
+import numpy as np 
+import time # Added for GeminiService retry logic
 
-# Use a fixed seed for reproducible fake data (optional, but good for testing)
-Faker.seed(42)
-fake = Faker()
-
-# --- Placeholder for AI Parsing ---
-# Functions for PDF text extraction and AI parsing are replaced with simple placeholders
-def extract_text_from_pdf(content: bytes): return ""
-async def parse_with_gemini(text: str, filename: str): return []
-
-# --- Configuration for Tax and CIBIL ---
+# --- Configuration: All Tax Rules, Slabs, and Limits ---
+# Updated TAX_CONFIG to be used by both calculation and AI logic.
 TAX_CONFIG: Dict[str, Any] = {
     'cess_rate': 0.04,
     'deductions': {
-        '80c_max': 150000
+        '80c_max': 150000,
+        '80d_self_family': 25000,
+        '80d_senior_parents': 50000,
+        '80ccd1b_nps': 50000,
+        '24b_home_loan_interest': 200000
     },
     'old_regime': {
         'standard_deduction': 50000, 
@@ -80,6 +78,105 @@ SCORE_RANGES = {
     'poor': {'min': 300, 'status': 'Poor'}
 }
 
+# Use a fixed seed for reproducible fake data (optional, but good for testing)
+Faker.seed(42)
+fake = Faker()
+
+# --- Gemini API Integration Service (REST Implementation) ---
+# NOTE: This class requires the GEMINI_API_KEY environment variable.
+class GeminiService:
+    """A service to handle all interactions with the Gemini API via REST."""
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        # NOTE: Using a powerful, fast model for complex, grounded reasoning
+        self.api_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent" 
+        self.system_prompt = (
+            "You are a forensic tax analyst and optimization expert. Your primary goal is to be maximally aggressive in finding tax-saving opportunities by meticulously analyzing raw financial transaction data. Your advice must be rigorously based on the Indian Income Tax Act, 1961. "
+            "CRITICAL DIRECTIVES: 1. Forensic Transaction Analysis: Scan all transaction descriptions in 'income_transactions', 'investment_transactions', and 'deduction_eligible_expenses' for hidden clues (e.g., 'LIC Premium', 'School Fee', 'Donation'). 2. MANDATORY Grounding and Citation: You MUST use the integrated Google Search tool to verify every piece of tax advice. Cite the raw, grounded URLs (containing 'vertexaisearch.cloud.google.com') in the 'sources' array for each suggestion. 3. Justify with Data: Your 'reasoning' MUST explicitly reference the transaction description(s) that triggered your analysis. 4. Strict JSON Output: Your entire response MUST be a single, valid JSON array of objects. Do not wrap it in markdown. Each object must contain 'section', 'suggestion', 'potential_tax_saving', 'reasoning', and 'sources' (an array of {title, url} objects)."
+        )
+
+    def get_suggestions(self, financial_summary: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Fetches personalized tax-saving suggestions from the Gemini API using a direct REST call.
+        """
+        user_prompt = (
+            "Based on the following comprehensive financial data, please provide all actionable tax-saving suggestions you can find for me in the specified JSON format. "
+            "Analyze the transaction lists carefully for hidden opportunities. Ensure every suggestion is grounded, cites the relevant tax law, and includes its own list of sources. "
+            f"Financial Summary:\n{json.dumps(financial_summary, indent=2)}"
+        )
+        suggestions = []
+
+        headers = {
+            'x-goog-api-key': self.api_key,
+            'Content-Type': 'application/json'
+        }
+        
+        payload = {
+            "contents": [{"parts": [{"text": user_prompt}]}],
+            "tools": [{"google_search": {}}],
+            "systemInstruction": {"parts": [{"text": self.system_prompt}]}
+        }
+
+        # --- Retry Logic with Exponential Backoff ---
+        max_retries = 3
+        base_delay = 1 
+        for attempt in range(max_retries):
+            try:
+                # Increased timeout to 180 seconds (3 minutes) to allow for complex processing
+                response = requests.post(self.api_url, headers=headers, json=payload, timeout=180)
+
+                if 500 <= response.status_code < 600:
+                    logger.warning(f"Received server error {response.status_code}. Retrying in {base_delay * (2 ** attempt)}s...")
+                    time.sleep(base_delay * (2 ** attempt))
+                    continue 
+
+                response.raise_for_status() 
+                
+                response_data = response.json()
+
+                if not response_data.get('candidates'):
+                    logger.warning("Gemini API response did not contain 'candidates'.")
+                    return []
+                
+                candidate = response_data['candidates'][0]
+                suggestions_text = candidate.get('content', {}).get('parts', [{}])[0].get('text', '').strip()
+                
+                if not suggestions_text:
+                    logger.warning("Gemini API returned an empty text response.")
+                    return []
+
+                # Clean up markdown JSON wrapper if present
+                if suggestions_text.startswith("```json"):
+                    suggestions_text = suggestions_text[7:]
+                if suggestions_text.endswith("```"):
+                    suggestions_text = suggestions_text[:-3]
+                suggestions_text = suggestions_text.strip()
+
+                try:
+                    parsed_suggestions = json.loads(suggestions_text)
+                    if isinstance(parsed_suggestions, list) and all(isinstance(item, dict) for item in parsed_suggestions):
+                        return parsed_suggestions # Success, exit the loop and return
+                    else:
+                        logger.warning(f"API response was valid JSON but not a list of objects. Response: {suggestions_text}")
+                        return [] 
+                except json.JSONDecodeError:
+                    logger.error(f"Failed to decode JSON from API response. Text: {suggestions_text}")
+                    return [] 
+
+            except requests.exceptions.RequestException as e:
+                logger.error(f"An error occurred during the REST API call: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(base_delay * (2 ** attempt))
+                else:
+                    break 
+            except Exception as e:
+                logger.error(f"An unexpected error occurred: {e}")
+                break 
+        
+        return suggestions # Return empty list if all retries fail
+
+# --- End of Gemini Service Class ---
+
 # Simple logging setup
 logging.basicConfig(
     level=logging.INFO,
@@ -90,7 +187,7 @@ logger = logging.getLogger(__name__)
 # --- FastAPI App Initialization ---
 app = FastAPI(
     title="Unified Financial Analysis API", 
-    version="1.0.0 (Unified)", 
+    version="1.0.0 (AI-Integrated)", 
     description="Single API for data processing, tax analysis, and CIBIL scoring."
 )
 
@@ -102,6 +199,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Initialize Gemini Service if key is available
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+gemini_service_instance = GeminiService(GEMINI_API_KEY) if GEMINI_API_KEY else None
+if gemini_service_instance: logger.info("--- Gemini Service Initialized (REST) ---")
+else: logger.warning("--- WARNING: GEMINI_API_KEY not found. AI suggestions disabled. ---")
+
 
 # Railway-optimized storage (memory only)
 PROCESSED_DATA_STORE = {}
@@ -708,24 +812,33 @@ def parse_saving_amount(value: Any) -> float:
                 return 0.0
     return 0.0
 
-def unified_get_tax_analysis(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Core tax analysis, calculating tax under old and new regimes and providing suggestions."""
+def unified_get_tax_analysis(user_data: Dict[str, Any], gemini_service: GeminiService | None) -> Dict[str, Any]:
+    """Core tax analysis, calculating tax under old and new regimes and calling AI for suggestions."""
     
-    tax_data = data['tax_relevant_data']
-    income_transactions = data['income_transactions']
-    investment_transactions = data['investment_transactions']
-    deduction_eligible_expenses = data['deduction_eligible_expenses']
+    # Extract data (renamed from 'data' to 'user_data' for clarity with GeminiService)
+    tax_data = user_data['tax_relevant_data']
     
+    # Financial Metrics
     annual_income = tax_data['estimated_annual_income'] + tax_data.get('other_income', 0)
     monthly_income = tax_data['monthly_salary']
     investments = tax_data['tax_saving_investments']
     total_deductions = investments['total_deductions']
     c80_investments = investments['80c_investments']
+    
+    # Simplified 24B deduction calculation based on a mock estimation
+    max_24b = TAX_CONFIG['deductions']['24b_home_loan_interest']
+    estimated_annual_home_interest = 0
+    # The CIBIL data analysis would provide the "active_loans" list
+    if user_data.get('credit_behavior', {}).get('monthly_emi_burden', 0) > 0 and 'Home_Loan' in user_data.get('credit_behavior', {}).get('active_loans', []):
+         estimated_annual_home_interest = min(user_data['credit_behavior']['monthly_emi_burden'] * 12 * 0.5, max_24b)
 
+    deductible_24b = min(estimated_annual_home_interest, max_24b)
+
+    # Tax Calculations
     std_deduction_old = TAX_CONFIG['old_regime']['standard_deduction']
     std_deduction_new = TAX_CONFIG['new_regime']['standard_deduction']
 
-    taxable_old = max(0, annual_income - std_deduction_old - total_deductions)
+    taxable_old = max(0, annual_income - std_deduction_old - total_deductions - deductible_24b)
     total_tax_old = compute_tax_for_regime(taxable_old, TAX_CONFIG['old_regime'])
 
     taxable_new = max(0, annual_income - std_deduction_new)
@@ -740,34 +853,78 @@ def unified_get_tax_analysis(data: Dict[str, Any]) -> Dict[str, Any]:
         recommended_regime, savings = "New Regime", total_tax_old - total_tax_new
         
     all_suggestions = []
+    
+    # --- 1. Base Suggestion: Maximize 80C (Local Rule) ---
+    # This remains as a fail-safe even if AI fails or is disabled
     max_80c = TAX_CONFIG['deductions']['80c_max']
     additional_80c_needed = max(0, max_80c - c80_investments)
-    
-    # Ensure optimized suggestions are returned (specifically the 80C one)
     if additional_80c_needed > 0 and recommended_regime == "Old Regime":
         marginal_rate = get_marginal_rate(taxable_old, TAX_CONFIG['old_regime']['slabs'])
         potential_saving = round(additional_80c_needed * marginal_rate * (1 + TAX_CONFIG['cess_rate']))
         all_suggestions.append({
-            "section": "80C", 
+            "section": "80C (Local Check)", 
             "suggestion": f"Invest additional ₹{additional_80c_needed:,.0f} in ELSS/PPF/Life Insurance to claim the maximum possible deduction.",
             "potential_tax_saving": potential_saving, 
-            "investment_options": ["ELSS Mutual Funds", "PPF", "Life Insurance Premium"], 
-            "reasoning": f"Your current 80C investments (₹{c80_investments:,.0f}) are below the maximum limit (₹{max_80c:,.0f}). Maximize savings by utilizing the remaining ₹{additional_80c_needed:,.0f} at your marginal rate of {marginal_rate*100:.0f}% plus cess.",
-            "sources": []
-        })
-    
-    if recommended_regime == "New Regime":
-         all_suggestions.append({
-            "section": "New Regime Benefit", 
-            "suggestion": "The New Tax Regime provides significant tax savings for your income level, suggesting few traditional deductions are needed.",
-            "potential_tax_saving": 0, 
-            "investment_options": [], 
-            "reasoning": f"Your New Regime tax (₹{round(total_tax_new):,.0f}) is lower than the Old Regime tax (₹{round(total_tax_old):,.0f}), indicating its slab structure and standard deduction are more beneficial for your current profile.",
+            "investment_options": ["ELSS Mutual Funds", "PPF", "EPF"], 
+            "reasoning": f"Local check: Your 80C investments are below the limit. Utilize the remaining ₹{additional_80c_needed:,.0f}.",
             "sources": []
         })
 
+    # --- 2. AI-Powered, Forensic Suggestions (Live Call) ---
+    if gemini_service:
+        # Pass the full, detailed user data to the AI for deep analysis
+        summary_for_ai = {
+            "tax_relevant_data": tax_data,
+            "credit_behavior": user_data.get("credit_behavior", {}),
+            "income_transactions": user_data.get("income_transactions", []),
+            "investment_transactions": user_data.get("investment_transactions", []),
+            "deduction_eligible_expenses": user_data.get("deduction_eligible_expenses", []),
+            "calculated_recommendation": recommended_regime,
+            "calculated_taxable_old": int(taxable_old)
+        }
+        gemini_suggestions = gemini_service.get_suggestions(summary_for_ai)
+        all_suggestions.extend(gemini_suggestions)
+    
+    # --- 3. Final Regime Recommendation (Local Rule) ---
+    if recommended_regime == "New Regime":
+        # Calculate the percentage difference for the reasoning
+        tax_diff = total_tax_old - total_tax_new
+        tax_diff_pct = round(tax_diff / total_tax_old * 100, 1) if total_tax_old > 0 else 0
+        
+        reasoning_text = (
+            f"The New Regime is recommended because it saves you ₹{int(round(tax_diff)):,.0f} ({tax_diff_pct}%) compared to the Old Regime. "
+            "This benefit is due to the lower tax slab rates, which outweigh the value of traditional deductions you currently claim. "
+            "NOTE: Under the New Regime, you forfeit Section 80C, 80D, and most HRA/LTA exemptions, relying primarily on the New Regime's standard deduction (₹75,000)."
+        )
+
+        all_suggestions.append({
+            "section": "Recommended Regime: New Tax Regime", 
+            "suggestion": f"Continue with the New Tax Regime to realize annual savings of ₹{int(round(tax_diff)):,.0f} based on your current income and investment profile.",
+            "potential_tax_saving": 0, 
+            "investment_options": ["Focus on non-tax-saving growth investments (Mutual Funds, Stocks)"], 
+            "reasoning": reasoning_text,
+            "sources": []
+        })
+    elif recommended_regime == "Old Regime":
+         # Add a counter-suggestion for the old regime if it was recommended
+        tax_diff = total_tax_new - total_tax_old
+        reasoning_text = (
+            f"The Old Regime is recommended because it saves you ₹{int(round(tax_diff)):,.0f} compared to the New Regime. "
+            "This confirms that your substantial investments (80C, 80D) and potential Home Loan interest deductions are currently very effective. "
+            "Action should focus on maximizing remaining limits like 80CCD(1B) and 80D."
+        )
+        all_suggestions.append({
+            "section": "Recommended Regime: Old Tax Regime", 
+            "suggestion": f"Maximize your current deductions and retain the Old Regime to realize annual savings of ₹{int(round(tax_diff)):,.0f}.",
+            "potential_tax_saving": 0, 
+            "investment_options": ["Maximize 80C/80CCD(1B)/80D investments"], 
+            "reasoning": reasoning_text,
+            "sources": []
+        })
+    
+
     output = {
-        "session_id": data['session_id'],
+        "session_id": user_data['session_id'],
         "income_analysis": {"annual_income": int(annual_income), "monthly_income": int(monthly_income), "current_deductions": int(total_deductions)},
         "tax_calculation": {
             "old_regime": {"total_tax": int(round(total_tax_old)), "effective_tax_rate": effective_old, "taxable_income": int(taxable_old)},
@@ -778,9 +935,9 @@ def unified_get_tax_analysis(data: Dict[str, Any]) -> Dict[str, Any]:
             "total_potential_savings": int(round(sum(parse_saving_amount(s.get('potential_tax_saving', 0)) for s in all_suggestions)))
         },
         "all_transactions": {
-            "income_transactions": income_transactions,
-            "investment_transactions": investment_transactions,
-            "deduction_eligible_expenses": deduction_eligible_expenses
+            "income_transactions": user_data.get("income_transactions", []),
+            "investment_transactions": user_data.get("investment_transactions", []),
+            "deduction_eligible_expenses": user_data.get("deduction_eligible_expenses", [])
         }
     }
     return output
@@ -788,7 +945,7 @@ def unified_get_tax_analysis(data: Dict[str, Any]) -> Dict[str, Any]:
 # --- Integrated CIBIL Logic (No Graphs) ---
 
 def unified_analyze_cibil(data: Dict) -> Dict[str, Any]:
-    """Core CIBIL analysis function, **excluding graph generation**."""
+    """Core CIBIL analysis function, excluding graph generation."""
 
     credit_behavior = data.get('credit_behavior', {})
     transactions = data.get('relevant_transactions', [])
@@ -1062,7 +1219,10 @@ async def analyze_cibil_score_endpoint(session_id: str):
 
 @app.get("/analyze-tax/{session_id}")
 async def analyze_tax_endpoint(session_id: str):
-    """Unified endpoint to run Tax analysis, returning tax calculation, regime recommendation, and optimization suggestions."""
+    """
+    Unified endpoint to run Tax analysis, calling Gemini for rich suggestions 
+    if the GEMINI_API_KEY is available.
+    """
     if session_id not in PROCESSED_DATA_STORE:
         raise HTTPException(status_code=404, detail="Session not found or expired")
 
@@ -1072,15 +1232,18 @@ async def analyze_tax_endpoint(session_id: str):
     tax_input_data = {
         'session_id': session_id,
         'tax_relevant_data': data.tax_relevant_data,
+        'income_analysis': data.income_analysis,
+        'credit_behavior': data.credit_behavior,
         'income_transactions': [t.to_dict() for t in data.transactions if t.type == TransactionType.INCOME],
         'investment_transactions': [t.to_dict() for t in data.transactions if t.type == TransactionType.INVESTMENT],
         'deduction_eligible_expenses': [
             t.to_dict() for t in data.transactions 
-            if t.subcategory and ('tax' in t.subcategory.lower() or t.category in ['Insurance', 'Investment'])
+            if t.subcategory and ('tax' in t.subcategory.lower() or t.category in ['Insurance', 'Investment', 'EMI'])
         ],
     }
     
-    analysis_result = unified_get_tax_analysis(tax_input_data)
+    # NOTE: Passing the global gemini_service_instance to the analysis function.
+    analysis_result = unified_get_tax_analysis(tax_input_data, gemini_service_instance)
     return analysis_result
 
 @app.get("/cibil-data/{session_id}")
@@ -1220,7 +1383,7 @@ async def health_check():
         "status": "healthy",
         "active_sessions": len(PROCESSED_DATA_STORE),
         "processing_queue": len([s for s in PROCESSING_STATUS.values() if s == "processing"]),
-        "version": "1.0.0 (Unified)",
+        "version": "1.0.0 (AI-Integrated)",
         "timestamp": datetime.now().isoformat()
     }
 
@@ -1229,13 +1392,13 @@ async def root():
     """API root endpoint"""
     return {
         "service": "Unified Financial Analysis API",
-        "version": "1.0.0 (Unified)",
+        "version": "1.0.0 (AI-Integrated)",
         "status": "running",
-        "description": "Process financial data, extract insights, perform CIBIL scoring, and calculate tax liability.",
+        "description": "Process financial data, extract insights, perform CIBIL scoring, and calculate tax liability (AI-Integrated for tax advice).",
         "endpoints": {
             "process_files": "POST /process-files (Upload CSV/PDF files)",
             "analyze_cibil": "GET /analyze-cibil/{session_id} (Full CIBIL score and advice)",
-            "analyze_tax": "GET /analyze-tax/{session_id} (Full Tax calculation and regime recommendation)",
+            "analyze_tax": "GET /analyze-tax/{session_id} (Full Tax calculation and AI-powered optimization)",
             "cibil_data": "GET /cibil-data/{session_id} (Raw CIBIL-relevant transaction data)",
             "tax_data": "GET /tax-data/{session_id} (Raw Tax-relevant transaction data)",
             "session_data": "GET /session-data/{session_id} (Complete processed data)",
@@ -1250,15 +1413,15 @@ async def root():
         }
     }
 
-if __name__ == "__main__":
-    import uvicorn
+# if __name__ == "__main__":
+#     import uvicorn
     
-    port = int(os.environ.get("PORT", 8000))
+#     port = int(os.environ.get("PORT", 8000))
     
-    logger.info("🚀 Starting Unified Financial Analysis API...")
-    uvicorn.run(
-        app, 
-        host="0.0.0.0", 
-        port=port,
-        log_level="info"
-    )
+#     logger.info("🚀 Starting Unified Financial Analysis API...")
+#     uvicorn.run(
+#         app, 
+#         host="0.0.0.0", 
+#         port=port,
+#         log_level="info"
+#     )
