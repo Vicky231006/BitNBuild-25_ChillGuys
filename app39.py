@@ -8,6 +8,7 @@ REST API call to the Gemini API for enhanced stability and control.
 import json
 import os
 import re
+import time
 from typing import Dict, Any, List, Tuple
 
 import requests
@@ -63,29 +64,42 @@ class GeminiService:
         self.api_key = api_key
         self.api_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
         self.system_prompt = (
-            "You are an expert-level Indian tax professional acting as a fiduciary financial advisor. Your primary directive is to provide accurate, actionable, and legally sound tax-saving suggestions based on the user's financial data. "
-            "Your advice must be rigorously based on the Indian Income Tax Act, 1961, and relevant Finance Acts for the current assessment year. "
-            "CRITICAL: You MUST use the integrated Google Search tool to ground every single claim and suggestion you make. Advice not supported by verifiable, real-world sources is unacceptable. "
-            "For each suggestion, you must cite the specific section of the Income Tax Act (e.g., 'Section 80D', 'Section 24(b)'). "
-            "Focus on common deductions beyond Section 80C, such as Section 80D (health insurance), Section 24b (home loan interest), and NPS contributions. Do not suggest anything related to Section 80C, as it is already handled. "
-            "Your entire response must be a single, valid JSON array of objects, and nothing else. Do not wrap it in markdown backticks. Each object must contain the following keys: 'section', 'suggestion', 'potential_tax_saving', and 'reasoning'. "
-            "The 'reasoning' field must explain how the financial data makes the user eligible under the cited tax law section and why it's a sound financial strategy for them, referencing the information you found via search."
+            "You are a forensic tax analyst and optimization expert. Your primary goal is to be maximally aggressive in finding tax-saving opportunities for the user by meticulously analyzing their raw transaction data. "
+            "Your advice must be rigorously based on the Indian Income Tax Act, 1961. "
+            "CRITICAL DIRECTIVES: "
+            "1. **Forensic Transaction Analysis:** Scan every single transaction description in 'income_transactions', 'investment_transactions', and 'deduction_eligible_expenses'. Your task is to find hidden clues. For example: "
+            "   - A transaction like 'Payment to Max Life Insurance' is a potential Section 80D (health) or 80C (life) deduction. "
+            "   - 'EMI - HDFC Bank' could be a home loan; you must suggest verifying this for a Section 24(b) deduction. "
+            "   - 'Donation - GiveIndia' is a clear flag for a Section 80G deduction. "
+            "   - 'School Fee' transactions are potential Section 80C deductions for tuition fees. "
+            "2. **MANDATORY Grounding and Citation:** This is your most important directive. "
+            "   a. **Use Google Search:** You MUST use the integrated Google Search tool to verify every piece of tax advice. Do not answer from memory. "
+            "   b. **Cite Grounded URLs Directly:** The `sources` array for each suggestion MUST contain the direct, uncleaned URLs provided by the Google Search tool. These URLs will contain 'vertexaisearch.cloud.google.com'. Do not resolve these to the final destination URL; use the raw link provided by the search grounding process. "
+            "   c. **Link Reasoning to Sources:** Your `reasoning` text for each suggestion must be directly derived from the information present in the sources you cite. "
+            "3. **Justify with Data:** For each suggestion, your 'reasoning' MUST explicitly reference the transaction description(s) that triggered your analysis (e.g., 'Based on your transaction described as \"LIC Premium Payment\", you may be eligible...'). "
+            "4. **Strict JSON Output:** Your entire response MUST be a single, valid JSON array of objects. Do not wrap it in markdown. Each object must contain these keys: "
+            "   - 'section': The specific section of the Income Tax Act (e.g., 'Section 80D'). "
+            "   - 'suggestion': A clear, actionable suggestion for the user. "
+            "   - 'potential_tax_saving': A quantified estimate of the potential tax saving. "
+            "   - 'reasoning': The detailed explanation, referencing specific transactions and supported by your cited sources. "
+            "   - 'sources': A JSON array of source objects, where each object has 'title' and 'url' keys, providing the verifiable, raw, grounded URLs for this specific suggestion."
         )
 
-    def get_suggestions(self, financial_summary: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    def get_suggestions(self, financial_summary: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
         Fetches personalized tax-saving suggestions from the Gemini API using a direct REST call.
+        Now expects sources to be nested within each suggestion.
         Args:
-            financial_summary: A dictionary containing the user's financial data.
+            financial_summary: A dictionary containing the user's detailed financial data.
         Returns:
-            A tuple containing a list of suggestions and a list of sources.
+            A list of suggestion dictionaries, each potentially containing its own list of sources.
         """
         user_prompt = (
-            "Based on the following financial data, please provide 1-2 actionable tax-saving suggestions for me in the specified JSON format. Ensure every suggestion is grounded using the search tool and cites the relevant tax law. "
+            "Based on the following comprehensive financial data, please provide all actionable tax-saving suggestions you can find for me in the specified JSON format. "
+            "Analyze the transaction lists carefully for hidden opportunities. Ensure every suggestion is grounded, cites the relevant tax law, and includes its own list of sources. "
             f"Financial Summary:\n{json.dumps(financial_summary, indent=2)}"
         )
         suggestions = []
-        sources: List[Dict[str, Any]] = []
 
         headers = {
             'x-goog-api-key': self.api_key,
@@ -98,58 +112,66 @@ class GeminiService:
             "systemInstruction": {"parts": [{"text": self.system_prompt}]}
         }
 
-        try:
-            response = requests.post(self.api_url, headers=headers, json=payload, timeout=60)
-            response.raise_for_status()  # Will raise an HTTPError for bad responses (4xx or 5xx)
-            
-            response_data = response.json()
-
-            # --- Robust Response Handling ---
-            if not response_data.get('candidates'):
-                print("Warning: Gemini API response did not contain 'candidates'.")
-                return [], []
-            
-            candidate = response_data['candidates'][0]
-            suggestions_text = candidate.get('content', {}).get('parts', [{}])[0].get('text', '').strip()
-            
-            if not suggestions_text:
-                print("Warning: Gemini API returned an empty text response.")
-                return [], []
-
-            # Clean markdown fences from the response string.
-            if suggestions_text.startswith("```json"):
-                suggestions_text = suggestions_text[7:]
-            if suggestions_text.endswith("```"):
-                suggestions_text = suggestions_text[:-3]
-            suggestions_text = suggestions_text.strip()
-
+        # --- Retry Logic with Exponential Backoff ---
+        max_retries = 3
+        base_delay = 1  # seconds
+        for attempt in range(max_retries):
             try:
-                parsed_suggestions = json.loads(suggestions_text)
-                if isinstance(parsed_suggestions, list) and all(isinstance(item, dict) for item in parsed_suggestions):
-                    suggestions = parsed_suggestions
+                # Increased timeout to 180 seconds (3 minutes) to allow for complex processing
+                response = requests.post(self.api_url, headers=headers, json=payload, timeout=180)
+
+                # If the status code is a server error (5xx), retry
+                if 500 <= response.status_code < 600:
+                    print(f"Warning: Received server error {response.status_code}. Retrying in {base_delay * (2 ** attempt)}s...")
+                    time.sleep(base_delay * (2 ** attempt))
+                    continue # Go to the next attempt
+
+                response.raise_for_status() # Raise an exception for other bad status codes (4xx)
+                
+                response_data = response.json()
+
+                if not response_data.get('candidates'):
+                    print("Warning: Gemini API response did not contain 'candidates'.")
+                    return []
+                
+                candidate = response_data['candidates'][0]
+                suggestions_text = candidate.get('content', {}).get('parts', [{}])[0].get('text', '').strip()
+                
+                if not suggestions_text:
+                    print("Warning: Gemini API returned an empty text response.")
+                    return []
+
+                if suggestions_text.startswith("```json"):
+                    suggestions_text = suggestions_text[7:]
+                if suggestions_text.endswith("```"):
+                    suggestions_text = suggestions_text[:-3]
+                suggestions_text = suggestions_text.strip()
+
+                try:
+                    parsed_suggestions = json.loads(suggestions_text)
+                    if isinstance(parsed_suggestions, list) and all(isinstance(item, dict) for item in parsed_suggestions):
+                        return parsed_suggestions # Success, exit the loop and return
+                    else:
+                        print(f"Warning: API response was valid JSON but not a list of objects. Response: {suggestions_text}")
+                        return [] # Not a retryable error
+                except json.JSONDecodeError:
+                    print(f"Error: Failed to decode JSON from API response. Text: {suggestions_text}")
+                    return [] # Not a retryable error
+
+            except requests.exceptions.RequestException as e:
+                print(f"An error occurred during the REST API call: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(base_delay * (2 ** attempt))
                 else:
-                    print(f"Warning: API response was valid JSON but not a list of objects. Response: {suggestions_text}")
-            except json.JSONDecodeError:
-                print(f"Error: Failed to decode JSON from API response. Text: {suggestions_text}")
+                    break # Max retries reached
+            except Exception as e:
+                print(f"An unexpected error occurred: {e}")
+                break # Non-retryable error, exit the loop
+        
+        return suggestions # Return empty list if all retries fail
 
-            # Extract citation sources from grounding metadata
-            grounding_meta = candidate.get('groundingMetadata', {})
-            if grounding_meta and 'groundingChunks' in grounding_meta:
-                for chunk in grounding_meta['groundingChunks']:
-                    if 'web' in chunk and chunk['web'].get('uri'):
-                        sources.append({
-                            "title": chunk['web'].get('title', 'N/A'),
-                            "url": chunk['web']['uri']
-                        })
 
-        except requests.exceptions.RequestException as e:
-            print(f"An error occurred during the REST API call: {e}")
-        except Exception as e:
-            print(f"An unexpected error occurred: {e}")
-            
-        return suggestions, sources
-
-# --- Core Calculation Logic (Unchanged) ---
+# --- Core Calculation Logic ---
 def calculate_tax_from_slabs(income: float, slabs: List[Dict[str, float]]) -> float:
     tax = 0.0; previous_limit = 0.0
     for slab in slabs:
@@ -199,7 +221,7 @@ def get_tax_analysis(user_data: Dict[str, Any], gemini_service: GeminiService | 
     try:
         session_id = user_data['session_id']
         tax_data = user_data['tax_relevant_data']
-        annual_income = tax_data['estimated_annual_income']
+        annual_income = tax_data['estimated_annual_income'] + tax_data.get('other_income', 0)
         monthly_income = tax_data['monthly_salary']
         investments = tax_data['tax_saving_investments']
         total_deductions = investments['total_deductions']
@@ -207,7 +229,6 @@ def get_tax_analysis(user_data: Dict[str, Any], gemini_service: GeminiService | 
     except KeyError as e:
         return {"error": f"Missing required key in input data: {e}"}, 400
 
-    # CORRECTED LOGIC: Pull the correct standard deduction for each regime
     std_deduction_old = TAX_CONFIG['old_regime']['standard_deduction']
     std_deduction_new = TAX_CONFIG['new_regime']['standard_deduction']
 
@@ -223,9 +244,9 @@ def get_tax_analysis(user_data: Dict[str, Any], gemini_service: GeminiService | 
     if total_tax_old < total_tax_new:
         recommended_regime, savings = "Old Regime", total_tax_new - total_tax_old
     else:
-        recommended_regime, savings = "New Regime", total_tax_old - total_tax_old
+        recommended_regime, savings = "New Regime", total_tax_old - total_tax_new
         
-    all_suggestions, gemini_sources = [], []
+    all_suggestions = []
     max_80c = TAX_CONFIG['deductions']['80c_max']
     additional_80c_needed = max(0, max_80c - c80_investments)
     if additional_80c_needed > 0 and recommended_regime == "Old Regime":
@@ -233,11 +254,18 @@ def get_tax_analysis(user_data: Dict[str, Any], gemini_service: GeminiService | 
         potential_saving = round(additional_80c_needed * marginal_rate * (1 + TAX_CONFIG['cess_rate']))
         all_suggestions.append({
             "section": "80C", "suggestion": f"Invest additional ₹{additional_80c_needed:,.0f} in ELSS/PPF",
-            "potential_tax_saving": potential_saving, "investment_options": ["ELSS Mutual Funds", "PPF", "EPF"]})
+            "potential_tax_saving": potential_saving, "investment_options": ["ELSS Mutual Funds", "PPF", "EPF"], "sources": []})
     
     if gemini_service:
-        summary_for_ai = {k: v for k, v in locals().items() if k in ["annual_income", "c80_investments", "total_deductions", "recommended_regime"]}
-        gemini_suggestions, gemini_sources = gemini_service.get_suggestions(summary_for_ai)
+        # Pass the full, detailed user data to the AI for deep analysis
+        summary_for_ai = {
+            "tax_relevant_data": tax_data,
+            "income_transactions": user_data.get("income_transactions", []),
+            "investment_transactions": user_data.get("investment_transactions", []),
+            "deduction_eligible_expenses": user_data.get("deduction_eligible_expenses", []),
+            "calculated_recommendation": recommended_regime
+        }
+        gemini_suggestions = gemini_service.get_suggestions(summary_for_ai)
         all_suggestions.extend(gemini_suggestions)
     
     output = {
@@ -249,8 +277,9 @@ def get_tax_analysis(user_data: Dict[str, Any], gemini_service: GeminiService | 
             "recommended_regime": recommended_regime, "savings": int(round(savings))},
         "deduction_optimization": {
             "optimization_suggestions": all_suggestions,
-            "total_potential_savings": int(round(sum(parse_saving_amount(s.get('potential_tax_saving', 0)) for s in all_suggestions))),
-            "sources": gemini_sources}}
+            "total_potential_savings": int(round(sum(parse_saving_amount(s.get('potential_tax_saving', 0)) for s in all_suggestions)))
+        } # Removed top-level 'sources' key
+    }
     return output, 200
 
 # --- API Endpoint ---
@@ -270,4 +299,3 @@ def analyze_tax_endpoint() -> Response:
 if __name__ == '__main__':
     print("--- Starting Flask Server ---")
     app.run(debug=True, host='0.0.0.0', port=5000)
-
