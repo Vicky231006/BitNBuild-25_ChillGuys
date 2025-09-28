@@ -239,19 +239,29 @@ def enhanced_categorize_transaction(description: str, amount: float) -> tuple:
     return result
 
 def parse_date_robust(date_str: str) -> str:
-    """Robust date parsing"""
+    """Robust date parsing (FIXED for YYYY-MM-DD strings)"""
     if not date_str or str(date_str).lower() in ['nan', 'none', '']:
         return datetime.now().strftime('%Y-%m-%d')
     
     date_str = str(date_str).strip()
     
+    # 1. Prioritize and validate the most common format (YYYY-MM-DD)
+    try:
+        # Attempt to parse the whole string directly, ensuring it succeeds if standardized
+        return datetime.strptime(date_str, '%Y-%m-%d').strftime('%Y-%m-%d')
+    except ValueError:
+        pass # If it fails, continue to the fallback loop
+        
+    # 2. Fallback to other common formats (original list)
     formats = [
-        '%Y-%m-%d', '%d/%m/%Y', '%m/%d/%Y', '%d-%m-%Y', 
+        '%d/%m/%Y', '%m/%d/%Y', '%d-%m-%Y', 
         '%d %b %Y', '%d %B %Y',
     ]
     
     for fmt in formats:
         try:
+            # For robustness, we still use truncation for mixed strings, but the clean 
+            # YYYY-MM-DD format should have already been handled above.
             parsed_date = datetime.strptime(date_str[:len(fmt)].replace('.', ''), fmt)
             return parsed_date.strftime('%Y-%m-%d')
         except:
@@ -1327,3 +1337,16 @@ async def root():
             "supported_formats": list(ALLOWED_EXTENSIONS)
         }
     }
+
+# if __name__ == "__main__":
+#     import uvicorn
+    
+#     port = int(os.environ.get("PORT", 8000))
+    
+#     logger.info("🚀 Starting Unified Financial Analysis API...")
+#     uvicorn.run(
+#         app, 
+#         host="0.0.0.0", 
+#         port=port,
+#         log_level="info"
+#     )
