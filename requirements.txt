@@ -1,9 +1,4 @@
-fastapi
-uvicorn[standard]
-requests
-matplotlib
-seaborn
-numpy
-pandas
-python-multipart
-pydantic
+streamlit
+google-generativeai
+python-dotenv
+typing-extensions
